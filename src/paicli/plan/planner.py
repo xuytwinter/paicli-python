@@ -3,15 +3,15 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 from paicli.llm.base import LlmClient
 from paicli.plan.models import ExecutionPlan, Task, TaskType
-from paicli.types import Message
+from paicli.types import Message, Usage
 
-PLANNER_PROMPT = """You are PaiCLI's planner.
-Create a compact executable DAG for the user's task.
-Return only JSON with this shape:
+PLANNER_PROMPT = """你是 PaiCLI 的任务规划器。
+请为用户任务创建一个简洁、可执行的 DAG，并仅返回以下结构的 JSON：
 {
   "summary": "short summary",
   "tasks": [
@@ -23,23 +23,55 @@ Return only JSON with this shape:
     }
   ]
 }
-Use independent tasks when they can run in parallel.
+可以并行的独立任务应放在同一执行批次中。
+summary 和 description 必须使用与用户目标相同的语言；用户目标包含中文时，必须使用中文。
+JSON 字段名、任务 id 和 type 枚举值保持上述英文格式。
 """
 
 
 class Planner:
     def __init__(self, llm_client: LlmClient):
         self.llm_client = llm_client
+        self.last_usage = Usage()
 
     async def create_plan(self, goal: str) -> ExecutionPlan:
+        plan: ExecutionPlan | None = None
+        async for event in self.stream_plan(goal):
+            if event.get("type") == "plan_created":
+                plan = event["plan"]
+        if plan is None:
+            raise ValueError("planner did not produce an execution plan")
+        return plan
+
+    async def stream_plan(self, goal: str) -> AsyncIterator[dict[str, Any]]:
+        """Create a plan while preserving provider reasoning and usage events."""
+        self.last_usage = Usage()
         if _is_simple_goal(goal):
-            return _minimal_plan(goal)
-        text = await _collect_text(
-            self.llm_client,
-            [Message(role="user", content=f"Please create an execution plan for:\n{goal}")],
-            system_prompt=PLANNER_PROMPT,
-        )
-        return self.parse_plan(goal, text)
+            yield {"type": "plan_created", "plan": _minimal_plan(goal)}
+            return
+
+        text = ""
+        messages = [Message(role="user", content=f"请为以下目标创建执行计划：\n{goal}")]
+        async for event in self.llm_client.chat(messages, [], system_prompt=PLANNER_PROMPT):
+            event_type = event.get("type")
+            if event_type == "text_delta":
+                # Planner text is machine-readable JSON. Keep it out of the user-facing
+                # stream and expose the parsed plan below instead.
+                text += str(event.get("text") or "")
+            elif event_type == "thinking_delta":
+                yield {
+                    "type": "thinking_delta",
+                    "thinking": str(event.get("thinking") or ""),
+                    "phase": "planning",
+                }
+            elif event_type == "usage":
+                usage = Usage.from_mapping(event.get("usage") or {})
+                self.last_usage = self.last_usage + usage
+                yield {"type": "usage", "usage": usage.to_dict(), "phase": "planning"}
+            elif event_type == "error":
+                raise event["error"]
+
+        yield {"type": "plan_created", "plan": self.parse_plan(goal, text)}
 
     async def replan(self, failed_plan: ExecutionPlan, failure_reason: str) -> ExecutionPlan:
         completed = "\n".join(
@@ -48,7 +80,7 @@ class Planner:
             if task.result and not task.error
         )
         return await self.create_plan(
-            f"{failed_plan.goal}\nFailure reason: {failure_reason}\nCompleted tasks:\n{completed}"
+            f"{failed_plan.goal}\n失败原因：{failure_reason}\n已完成任务：\n{completed}"
         )
 
     def parse_plan(self, goal: str, plan_json: str) -> ExecutionPlan:
@@ -101,14 +133,27 @@ async def _collect_text(
     *,
     system_prompt: str,
 ) -> str:
+    text, _usage = await _collect_text_and_usage(llm_client, messages, system_prompt=system_prompt)
+    return text
+
+
+async def _collect_text_and_usage(
+    llm_client: LlmClient,
+    messages: list[Message],
+    *,
+    system_prompt: str,
+) -> tuple[str, Usage]:
     text = ""
+    usage = Usage()
     async for event in llm_client.chat(messages, [], system_prompt=system_prompt):
         event_type = event.get("type")
         if event_type == "text_delta":
             text += str(event.get("text") or "")
+        elif event_type == "usage":
+            usage = usage + Usage.from_mapping(event.get("usage") or {})
         elif event_type == "error":
             raise event["error"]
-    return text
+    return text, usage
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

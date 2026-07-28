@@ -10,6 +10,9 @@ This file tracks the Python port against the existing Java and TypeScript implem
   - `--provider`
   - `--model`
   - `--plain`
+  - `--mode react|plan|team`
+  - `--worker-mode react|plan`
+  - `--json` usage/cost output
   - `--cwd`
   - `paicli doctor`
   - `paicli serve --http --port <port>`
@@ -28,6 +31,9 @@ This file tracks the Python port against the existing Java and TypeScript implem
   - `/search`
   - `/plan`
   - `/team`
+  - `/model` Default/Custom Tab selector with live client switching
+  - persisted BYOK DeepSeek/GLM/OpenAI-compatible custom models
+  - `/usage`
   - `/task`
   - `/snapshot`
   - `/restore`
@@ -39,7 +45,8 @@ This file tracks the Python port against the existing Java and TypeScript implem
   - DeepSeek default
   - ReAct loop with text/thinking/tool-call/tool-result/done events
   - Plan-and-Execute agent with Planner-generated DAG, dependency ordering, and parallel executable batches
-  - Multi-Agent orchestrator with Planner, Worker, Reviewer, dependency scheduling, parallel workers, review approval parsing, and bounded retry
+  - Multi-Agent orchestrator with Planner, Worker, Reviewer, dependency scheduling, parallel workers, review approval parsing, bounded retry, and per-worker `react|plan` mode
+  - isolated Skill context per SubAgent and per parallel Plan task
   - SDK entrypoint with ReAct, Plan-and-Execute, and Multi-Agent methods
   - pre/post side-history snapshots around Agent runs
 - Configuration:
@@ -60,7 +67,9 @@ This file tracks the Python port against the existing Java and TypeScript implem
   - `web_search`
   - `web_fetch`
   - `save_memory`
+  - `search_memory`
   - `load_skill`
+  - `save_skill` with mandatory HITL approval
   - `search_code`
   - `revert_turn`
 - Safety:
@@ -69,13 +78,19 @@ This file tracks the Python port against the existing Java and TypeScript implem
   - HITL approval
   - JSONL AuditLog
 - Memory:
-  - SQLite long-term memory
-  - project memory files `PAI.md`, `.paicli/PAI.md`, local variants
+  - static project memory files `AGENTS.md`, `PAI.md`, `.paicli/PAI.md`, local variants
+  - governed SQLite dynamic memory with metadata, normalized deduplication, TTL, quota, access tracking, and relevance recall
+  - automatic request-specific Top-K recall plus model-initiated `search_memory`
+  - bounded short-term history and deterministic context compression
+  - cache-friendly static Prompt plus per-request dynamic Prompt
 - Skills:
   - built-in/user/project skill layers
   - user/project `.paicli/skills/*/SKILL.md`
   - `~/.paicli/skills.json` disabled-state store
   - `load_skill` with one-shot SkillContextBuffer injection
+  - current-query next-turn Skill injection (no one-request delay)
+  - name/description/tag Top-K matcher with Chinese n-gram support
+  - safe project/user create/update and model-proposed `save_skill`
   - `/skill list/show/on/off/reload`
 - RAG:
   - SQLite local code index
@@ -108,6 +123,10 @@ This file tracks the Python port against the existing Java and TypeScript implem
   - `GET /v1/tasks/{id}`
   - `POST /v1/tasks/{id}/cancel`
   - SQLite durable task queue
+  - task modes `react|plan|team`
+  - atomic claim, project scope, lease/heartbeat recovery, and cancellation-safe completion
+  - standalone `paicli worker`
+  - persisted Runtime thread history
 - Snapshot:
   - `pre-turn` / `post-turn`
   - `/snapshot`
@@ -122,6 +141,11 @@ This file tracks the Python port against the existing Java and TypeScript implem
   - provider/model capability fallback
 - Diagnostics:
   - Python syntax diagnostics after `write_file`
+- Usage and cost:
+  - OpenAI-compatible streaming usage-only chunks
+  - input/output/cache-hit/cache-miss/reasoning token aggregation
+  - dated DeepSeek V4 Flash/Pro price profiles with config overrides
+  - ReAct/Plan/Team SDK and CLI aggregation
 
 ## Live Dependencies
 

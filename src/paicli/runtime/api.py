@@ -5,7 +5,6 @@ import json
 import os
 import sqlite3
 import threading
-import time
 from dataclasses import asdict
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +15,12 @@ from paicli.agent import QueryEngine
 from paicli.bootstrap import build_tool_registry
 from paicli.config import PaiCliConfig
 from paicli.llm import create_llm_client
-from paicli.runtime.tasks import DurableTaskManager
+from paicli.runtime.tasks import TASK_MODES, DurableTaskManager, TaskRecord
+from paicli.types import Message
+
+
+class TaskCanceledError(RuntimeError):
+    pass
 
 
 class RuntimeApiServer:
@@ -35,19 +39,15 @@ class RuntimeApiServer:
         self.port = port
         self.db_path = Path.home() / ".paicli" / "runtime" / "runtime.db"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.task_manager = DurableTaskManager(Path.home() / ".paicli" / "tasks" / "tasks.db")
+        self.task_manager = DurableTaskManager(
+            Path.home() / ".paicli" / "tasks" / "tasks.db", scope=self.cwd
+        )
         self.workers = workers
         self._stop = threading.Event()
         self._ensure_schema()
 
     def serve_forever(self) -> None:
-        for index in range(self.workers):
-            thread = threading.Thread(
-                target=self._worker_loop,
-                name=f"paicli-task-{index}",
-                daemon=True,
-            )
-            thread.start()
+        self._start_workers()
 
         outer = self
 
@@ -68,6 +68,29 @@ class RuntimeApiServer:
         finally:
             self._stop.set()
 
+    def work_forever(self) -> None:
+        """Run only durable task workers, without exposing the HTTP API."""
+
+        self._start_workers()
+        print(f"PaiCLI task worker running with {self.workers} workers", flush=True)
+        try:
+            while not self._stop.wait(0.5):
+                pass
+        except KeyboardInterrupt:
+            self._stop.set()
+
+    def _start_workers(self) -> None:
+        self.task_manager.requeue_expired()
+        for index in range(self.workers):
+            worker_id = f"{os.getpid()}-{index}"
+            thread = threading.Thread(
+                target=self._worker_loop,
+                args=(worker_id,),
+                name=f"paicli-task-{index}",
+                daemon=True,
+            )
+            thread.start()
+
     def _handle(self, request: BaseHTTPRequestHandler) -> None:
         if not self._authorized(request):
             _send_json(request, 401, {"error": "unauthorized"})
@@ -85,7 +108,8 @@ class RuntimeApiServer:
                 if not message:
                     _send_json(request, 400, {"error": "message is required"})
                     return
-                result = asyncio.run(self._run_turn(thread_id, message))
+                mode = _mode_from_body(body)
+                result = asyncio.run(self._run_turn(thread_id, message, mode=mode))
                 _send_json(request, 200, result)
             elif method == "GET" and path.startswith("/v1/threads/") and path.endswith("/events"):
                 thread_id = path.split("/")[3]
@@ -95,8 +119,9 @@ class RuntimeApiServer:
                 if not prompt:
                     _send_json(request, 400, {"error": "message is required"})
                     return
-                task_id = self.task_manager.add(prompt)
-                _send_json(request, 200, {"id": task_id, "status": "queued"})
+                mode = _mode_from_body(body)
+                task_id = self.task_manager.add(prompt, mode=mode)
+                _send_json(request, 200, {"id": task_id, "status": "queued", "mode": mode})
             elif method == "GET" and path == "/v1/tasks":
                 _send_json(request, 200, {"tasks": [asdict(t) for t in self.task_manager.list()]})
             elif method == "GET" and path.startswith("/v1/tasks/"):
@@ -108,12 +133,93 @@ class RuntimeApiServer:
                 _send_json(request, 200, {"canceled": self.task_manager.cancel(task_id)})
             else:
                 _send_json(request, 404, {"error": "not found"})
+        except ValueError as exc:
+            _send_json(request, 400, {"error": str(exc)})
         except Exception as exc:  # noqa: BLE001 - API boundary
             _send_json(request, 500, {"error": str(exc)})
 
-    async def _run_turn(self, thread_id: str, message: str) -> dict[str, Any]:
+    async def _run_turn(
+        self, thread_id: str, message: str, *, mode: str = "react"
+    ) -> dict[str, Any]:
         self._ensure_llm_key()
-        self._append_event(thread_id, "turn.started", {"message": message})
+        mode = _validate_mode(mode)
+        self._append_event(thread_id, "turn.started", {"message": message, "mode": mode})
+        registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
+        engine = QueryEngine(
+            llm_client=create_llm_client(self.config.llm),
+            tool_registry=registry,
+            config=self.config,
+            cwd=self.cwd,
+        )
+        history = self._thread_history(thread_id) if mode == "react" else []
+        text = ""
+        events = _engine_events(engine, mode, message, history=history)
+        total_tokens = 0
+        async for event in events:
+            event_type = str(event.get("type"))
+            if event_type == "text_delta":
+                text += str(event.get("text") or "")
+                self._append_event(thread_id, "message.delta", {"text": event.get("text") or ""})
+            elif event_type in {"tool_call", "tool_result", "error", "done"}:
+                self._append_event(thread_id, event_type, _jsonable(event))
+                if event_type == "error":
+                    raise event["error"]
+                if event_type == "done":
+                    total_tokens = int(event.get("total_tokens") or 0)
+        self._append_thread_message(thread_id, "user", message)
+        self._append_thread_message(thread_id, "assistant", text)
+        self._append_event(
+            thread_id,
+            "turn.completed",
+            {"text": text, "mode": mode, "total_tokens": total_tokens},
+        )
+        return {
+            "thread_id": thread_id,
+            "text": text,
+            "mode": mode,
+            "total_tokens": total_tokens,
+        }
+
+    def _worker_loop(self, worker_id: str) -> None:
+        while not self._stop.is_set():
+            task = self.task_manager.claim_next(worker_id, lease_seconds=300)
+            if not task:
+                self._stop.wait(0.5)
+                continue
+            heartbeat_stop = threading.Event()
+            heartbeat = threading.Thread(
+                target=self._heartbeat_loop,
+                args=(task.id, worker_id, heartbeat_stop),
+                name=f"paicli-heartbeat-{task.id}",
+                daemon=True,
+            )
+            heartbeat.start()
+            try:
+                result = asyncio.run(self._run_task(task))
+                self.task_manager.complete(task.id, result, worker_id=worker_id)
+            except TaskCanceledError:
+                # cancel() owns the terminal state; never overwrite it from the worker.
+                pass
+            except Exception as exc:  # noqa: BLE001
+                self.task_manager.fail(task.id, str(exc), worker_id=worker_id)
+            finally:
+                heartbeat_stop.set()
+                heartbeat.join(timeout=1)
+
+    def _heartbeat_loop(
+        self,
+        task_id: str,
+        worker_id: str,
+        stop: threading.Event,
+    ) -> None:
+        while not stop.wait(30):
+            if not self.task_manager.heartbeat(task_id, worker_id, lease_seconds=300):
+                return
+
+    async def _run_task(self, task: TaskRecord) -> str:
+        self._ensure_llm_key()
+        if self.task_manager.is_canceled(task.id):
+            raise TaskCanceledError(task.id)
         registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
         engine = QueryEngine(
             llm_client=create_llm_client(self.config.llm),
@@ -122,38 +228,14 @@ class RuntimeApiServer:
             cwd=self.cwd,
         )
         text = ""
-        async for event in engine.ask(message):
-            event_type = str(event.get("type"))
-            if event_type == "text_delta":
+        async for event in _engine_events(engine, task.mode, task.prompt):
+            if self.task_manager.is_canceled(task.id):
+                raise TaskCanceledError(task.id)
+            if event.get("type") == "text_delta":
                 text += str(event.get("text") or "")
-                self._append_event(thread_id, "message.delta", {"text": event.get("text") or ""})
-            elif event_type in {"tool_call", "tool_result", "error", "done"}:
-                self._append_event(thread_id, event_type, _jsonable(event))
-        self._append_event(thread_id, "turn.completed", {"text": text})
-        return {"thread_id": thread_id, "text": text}
-
-    def _worker_loop(self) -> None:
-        while not self._stop.is_set():
-            task = self.task_manager.claim_next()
-            if not task:
-                time.sleep(0.5)
-                continue
-            try:
-                result = asyncio.run(self._run_task(task.prompt))
-                self.task_manager.complete(task.id, result)
-            except Exception as exc:  # noqa: BLE001
-                self.task_manager.fail(task.id, str(exc))
-
-    async def _run_task(self, prompt: str) -> str:
-        self._ensure_llm_key()
-        registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
-        engine = QueryEngine(
-            llm_client=create_llm_client(self.config.llm),
-            tool_registry=registry,
-            config=self.config,
-            cwd=self.cwd,
-        )
-        return (await engine.ask_complete_async(prompt)).text
+            elif event.get("type") == "error":
+                raise event["error"]
+        return text
 
     def _ensure_llm_key(self) -> None:
         if not self.config.llm.api_key:
@@ -191,6 +273,30 @@ class RuntimeApiServer:
                 ),
             )
 
+    def _append_thread_message(self, thread_id: str, role: str, content: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                insert into messages(thread_id, role, content, created_at)
+                values (?, ?, ?, ?)
+                """,
+                (thread_id, role, content, datetime.now(UTC).isoformat()),
+            )
+
+    def _thread_history(self, thread_id: str, limit: int = 100) -> list[Message]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                select role, content
+                from messages
+                where thread_id = ?
+                order by id desc
+                limit ?
+                """,
+                (thread_id, limit),
+            ).fetchall()
+        return [Message(role=role, content=content) for role, content in reversed(rows)]
+
     def _send_events(self, request: BaseHTTPRequestHandler, thread_id: str) -> None:
         with self._connect() as conn:
             rows = conn.execute(
@@ -220,6 +326,20 @@ class RuntimeApiServer:
                     created_at text not null
                 )
                 """
+            )
+            conn.execute(
+                """
+                create table if not exists messages (
+                    id integer primary key autoincrement,
+                    thread_id text not null,
+                    role text not null,
+                    content text not null,
+                    created_at text not null
+                )
+                """
+            )
+            conn.execute(
+                "create index if not exists idx_messages_thread on messages(thread_id, id)"
             )
             conn.execute(
                 """
@@ -272,3 +392,22 @@ def runtime_api_key(explicit: str | None = None) -> str:
     if not key:
         raise ValueError("PAICLI_RUNTIME_API_KEY is required for Runtime API")
     return key
+
+
+def _mode_from_body(body: dict[str, Any]) -> str:
+    return _validate_mode(str(body.get("mode") or "react"))
+
+
+def _validate_mode(mode: str) -> str:
+    value = mode.strip().lower()
+    if value not in TASK_MODES:
+        raise ValueError(f"mode must be one of: {', '.join(sorted(TASK_MODES))}")
+    return value
+
+
+def _engine_events(engine: QueryEngine, mode: str, message: str, *, history=None):
+    if mode == "plan":
+        return engine.plan(message)
+    if mode == "team":
+        return engine.team(message)
+    return engine.ask(message, history=history)

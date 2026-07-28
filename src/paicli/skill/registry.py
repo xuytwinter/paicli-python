@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,6 +23,39 @@ class Skill:
     @property
     def body(self) -> str:
         return _strip_frontmatter(self.content).strip()
+
+
+class SkillMatcher:
+    """Rank enabled skills against a user request using lightweight lexical signals."""
+
+    def __init__(self, skills: Iterable[Skill]):
+        self.skills = tuple(skill for skill in skills if skill.enabled)
+
+    def match(self, query: str, *, top_k: int = 5) -> list[Skill]:
+        if top_k <= 0 or not query.strip():
+            return []
+        query_terms = _match_terms(query)
+        ranked: list[tuple[int, str, Skill]] = []
+        for skill in self.skills:
+            score = self._score(query, query_terms, skill)
+            if score > 0:
+                ranked.append((score, skill.name, skill))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [skill for _score, _name, skill in ranked[:top_k]]
+
+    @staticmethod
+    def _score(query: str, query_terms: set[str], skill: Skill) -> int:
+        score = 0
+        if _explicit_skill_name(query, skill.name):
+            score += 10_000 + len(_compact_match_text(skill.name))
+
+        name_terms = _match_terms(skill.name)
+        tag_terms = _match_terms(" ".join(skill.tags))
+        description_terms = _match_terms(skill.description)
+        score += 12 * len(query_terms & name_terms)
+        score += 6 * len(query_terms & tag_terms)
+        score += 2 * len(query_terms & description_terms)
+        return score
 
 
 class SkillContextBuffer:
@@ -146,6 +181,75 @@ class SkillRegistry:
         self.reload()
         return True
 
+    def match(self, query: str, *, top_k: int = 5) -> list[Skill]:
+        return SkillMatcher(self.enabled_skills()).match(query, top_k=top_k)
+
+    def create(
+        self,
+        name: str,
+        *,
+        description: str,
+        body: str,
+        scope: str = "project",
+        version: str = "1.0.0",
+        tags: list[str] | None = None,
+        overwrite: bool = False,
+    ) -> Skill:
+        slug = _validate_skill_slug(name)
+        description = description.strip()
+        body = body.strip()
+        if not description:
+            raise ValueError("skill description must not be empty")
+        if not body:
+            raise ValueError("skill body must not be empty")
+
+        path = self._skill_path(slug, scope)
+        if path.exists() and not overwrite:
+            raise FileExistsError(f'skill "{slug}" already exists in {scope} scope')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            _render_skill_file(
+                name=slug,
+                description=description,
+                body=body,
+                version=version,
+                tags=tags or [],
+            ),
+            encoding="utf-8",
+        )
+        self.reload()
+        skill = self._load_skill_file(path, scope, self.state_store.disabled())
+        if not skill:  # pragma: no cover - the file was just written successfully
+            raise OSError(f"failed to load newly written skill: {path}")
+        return skill
+
+    def update(
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        body: str | None = None,
+        scope: str = "project",
+        version: str | None = None,
+        tags: list[str] | None = None,
+    ) -> Skill:
+        slug = _validate_skill_slug(name)
+        path = self._skill_path(slug, scope)
+        if not path.is_file():
+            raise FileNotFoundError(f'skill "{slug}" does not exist in {scope} scope')
+        existing = self._load_skill_file(path, scope, self.state_store.disabled())
+        if not existing:
+            raise ValueError(f'skill "{slug}" could not be parsed')
+        return self.create(
+            slug,
+            description=description if description is not None else existing.description,
+            body=body if body is not None else existing.body,
+            scope=scope,
+            version=version if version is not None else existing.version,
+            tags=tags if tags is not None else existing.tags,
+            overwrite=True,
+        )
+
     def index_text(self, max_chars: int = 4000, max_skills: int = 20) -> str:
         skills = self.enabled_skills()[:max_skills]
         if not skills:
@@ -161,6 +265,27 @@ class SkillRegistry:
             lines.append(f"- {skill.name}: {description}")
         text = "\n".join(lines)
         return text[:max_chars]
+
+    def _scope_root(self, scope: str) -> Path:
+        if scope == "project":
+            root = self.project_skill_root.resolve()
+            try:
+                root.relative_to(self.project_root)
+            except ValueError as exc:
+                raise ValueError("project skill root must stay inside the project") from exc
+            return root
+        if scope == "user":
+            return self.user_root.expanduser().resolve()
+        raise ValueError('skill scope must be "project" or "user"')
+
+    def _skill_path(self, name: str, scope: str) -> Path:
+        root = self._scope_root(scope)
+        path = root / name / "SKILL.md"
+        try:
+            path.resolve().relative_to(root)
+        except ValueError as exc:
+            raise ValueError("skill path must stay inside its scope root") from exc
+        return path
 
     def _load_all(self) -> dict[str, Skill]:
         if self._skills is not None:
@@ -245,3 +370,77 @@ def _parse_tags(raw: str) -> list[str]:
     if value.startswith("[") and value.endswith("]"):
         value = value[1:-1]
     return [item.strip().strip('"').strip("'") for item in value.split(",") if item.strip()]
+
+
+_SKILL_SLUG = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
+_ASCII_TERM = re.compile(r"[a-z0-9]+")
+_CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+_MATCH_STOPWORDS = {"and", "for", "from", "the", "this", "use", "with"}
+
+
+def _validate_skill_slug(name: str) -> str:
+    if not isinstance(name, str) or not _SKILL_SLUG.fullmatch(name):
+        raise ValueError(
+            "skill name must be a lowercase slug using letters, numbers, hyphens, or underscores"
+        )
+    return name
+
+
+def _render_skill_file(
+    *,
+    name: str,
+    description: str,
+    body: str,
+    version: str,
+    tags: list[str],
+) -> str:
+    clean_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
+    lines = ["---", f"name: {name}", "description: |"]
+    lines.extend(f"  {line}" for line in description.splitlines())
+    lines.extend(
+        [
+            f"version: {json.dumps(str(version), ensure_ascii=False)}",
+            f"tags: {json.dumps(clean_tags, ensure_ascii=False)}",
+            "---",
+            "",
+            body.rstrip(),
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _normalize_match_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = re.sub(r"[^a-z0-9\u3400-\u4dbf\u4e00-\u9fff]+", " ", normalized)
+    return " ".join(normalized.split())
+
+
+def _compact_match_text(value: str) -> str:
+    return _normalize_match_text(value).replace(" ", "")
+
+
+def _explicit_skill_name(query: str, name: str) -> bool:
+    normalized_query = _normalize_match_text(query)
+    normalized_name = _normalize_match_text(name)
+    if not normalized_name:
+        return False
+    tokens = normalized_name.split()
+    pattern = r"(?<![a-z0-9])" + r"\s+".join(re.escape(token) for token in tokens)
+    pattern += r"(?![a-z0-9])"
+    return re.search(pattern, normalized_query) is not None
+
+
+def _match_terms(value: str) -> set[str]:
+    normalized = _normalize_match_text(value)
+    terms = {
+        term
+        for term in _ASCII_TERM.findall(normalized)
+        if len(term) >= 2 and term not in _MATCH_STOPWORDS
+    }
+    for run in _CJK_RUN.findall(normalized):
+        if len(run) <= 4:
+            terms.add(run)
+        for size in (2, 3):
+            terms.update(run[index : index + size] for index in range(len(run) - size + 1))
+    return terms

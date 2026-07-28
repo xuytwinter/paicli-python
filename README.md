@@ -31,15 +31,20 @@ PaiCLI Python 是一个运行在终端里的 AI Agent CLI，面向真实项目�
 - 支持 `DEEPSEEK_API_KEY` 等 provider-specific API Key
 - ReAct 工具调用循环，支持 thinking、tool call、tool result、final output 和 usage 事件
 - Plan-and-Execute 模式，使用独立 Planner 生成 DAG，并按依赖批次执行可并行任务
-- Multi-Agent 协作模式，包含 Planner、Worker、Reviewer、依赖调度、并行 worker 和 review 重试
+- Multi-Agent 协作模式，包含 Planner、Worker、Reviewer、依赖调度、并行 worker、review
+  重试，以及可切换到独立 Plan-and-Execute 的子 Agent
 - 内置文件、Shell、grep、glob、记忆、网页搜索、网页抓取、代码搜索等工具
 - HITL 人工确认、命令/路径安全策略和 JSONL 审计日志
 - MCP client，支持 stdio 和 Streamable HTTP MCP server
-- Skill 系统，支持内置、用户级和项目级 skill，支持启用/禁用和 `load_skill` 懒加载注入
+- Skill 系统，支持内置、用户级和项目级分层、输入 Top-K 匹配、`load_skill` 当前回合懒加载，
+  以及经 HITL 确认的 `save_skill` 流程沉淀
 - Chrome DevTools MCP 配置助手
 - PaiCLI 自身也可以作为 MCP server 暴露内置工具
-- Runtime API，支持线程、turn、事件日志和持久化后台任务
-- SQLite 长期记忆和本地代码索引
+- Runtime API，支持有历史的 thread、turn、事件日志，以及带原子抢占、租约恢复、取消保护、
+  项目隔离和 `react|plan|team` 模式的持久化后台任务
+- 静态项目记忆 + SQLite 动态长期记忆，支持元数据、去重、TTL、容量治理和相关性召回
+- 上下文预算与压缩：达到可用输入预算的 80% 后压缩旧轮次，保留近期消息和完整工具调用对
+- 完整 usage、缓存命中/未命中 Token、reasoning Token 和可配置成本估算
 - Agent run 前后自动创建快照，支持恢复现场
 - 支持本地图片和远程图片输入，并根据模型能力自动降级
 
@@ -69,6 +74,13 @@ uv run paicli
 
 ```bash
 uv run paicli -p "帮我总结这个项目"
+```
+
+选择运行模式并输出机器可读的 usage/cost：
+
+```bash
+uv run paicli --mode plan -p "先读取 README，再验证项目" --json
+uv run paicli --mode team --worker-mode plan -p "并行审计核心模块" --json
 ```
 
 检查当前环境：
@@ -107,6 +119,7 @@ PAICLI_API_KEY=your_key_here
 当前支持的 provider-specific API Key 包括：
 
 - `DEEPSEEK_API_KEY`
+- `ZAI_API_KEY`（GLM 官方推荐）
 - `GLM_API_KEY`
 - `STEP_API_KEY`
 - `KIMI_API_KEY`
@@ -137,18 +150,24 @@ uv run paicli -p "解释这个仓库"
 /context
 /memory
 /memory search <query>
+/memory stats
+/memory delete <id>
 /memory clear
 /save <fact>
 /config
 /tools
-/hitl on|off|always|auto|never
+/hitl default|auto
 /policy
 /audit [N]
 /index [path]
 /search <query>
 /plan <task>
 /team <task>
+/team --plan <task>
 /model
+/model <model-id>
+/model <provider> <model-id>
+/usage
 /skill
 /skill list
 /skill show <name>
@@ -157,13 +176,19 @@ uv run paicli -p "解释这个仓库"
 /skill reload
 /mcp
 /task
-/task add <task>
+/task add [--mode react|plan|team] <task>
 /task cancel <task_id>
 /task log <task_id>
 /snapshot
 /snapshot clean
 /restore <snapshot-id-or-index>
 ```
+
+`/model` 会打开交互式模型选择器：`Tab` 或左右方向键在 `Default`、`Custom`
+之间切换，上下方向键选择模型，`Enter` 立即切换当前 Agent。`Custom` 中可以选择已保存的
+BYOK 模型、创建新的 DeepSeek/GLM/OpenAI-compatible 配置，或按 `d` 删除配置。自定义配置
+保存在权限为 `0600` 的 `~/.paicli/models.json`；建议填写 API Key 环境变量名，只有显式输入
+API Key 时才会把密钥写入该文件。
 
 ## 内置工具
 
@@ -178,11 +203,52 @@ PaiCLI 内置了一组 Agent 可以调用的本地工具和联网工具：
 - `web_search`
 - `web_fetch`
 - `save_memory`
+- `search_memory`
 - `load_skill`
+- `save_skill`
 - `search_code`
 - `revert_turn`
 
 写文件、执行命令、远程 MCP 写操作、恢复快照等危险动作，会经过 policy、HITL 和 audit 处理。
+`save_skill` 也必须经过 HITL；模型可以提议沉淀，但不会静默改变后续行为。
+
+交互模式下按 `Shift+Tab` 可在两种会话权限模式间切换：
+
+- `Default`：使用启动时的 HITL、工作区路径和命令安全策略。
+- `Auto (full access)`：当前会话内不再请求审批，并关闭路径与命令守卫；再次按
+  `Shift+Tab` 会恢复启动时的默认策略。
+
+## Skill 匹配与沉淀
+
+Skill 按 `builtin -> user -> project` 加载，同名时后层覆盖前层：
+
+- builtin：产品默认能力
+- user：`~/.paicli/skills/*/SKILL.md`，跨项目复用
+- project：`.paicli/skills/*/SKILL.md`，最贴近当前仓库并拥有最高优先级
+
+每次用户输入先用 name、description、tags 做中英文词法/字符 n-gram Top-K 匹配，再把候选交给模型决定是否调用 `load_skill`。Skill 正文只在真正加载后进入当前 ReAct 的下一模型轮；每个并发子 Agent 都有独立 Skill 缓冲区，不会串线。
+
+当一次成功流程具备稳定输入、明确步骤和可复用边界时，模型可以调用 `save_skill` 提议写入 project 或 user 层。该工具默认拒绝覆盖已有 Skill，并强制人工确认。
+
+## 记忆、动态 Prompt 与上下文压缩
+
+PaiCLI 把记忆分成三层：
+
+- 短期记忆：当前 thread/session 的原始消息、工具调用和工具结果
+- 静态长期记忆：`AGENTS.md`、`PAI.md`、`.paicli/PAI.md` 及自定义 prompt 文件；人工维护、可版本控制
+- 动态长期记忆：按项目 scope 隔离的 SQLite 记录；包含 kind、source、importance、confidence、TTL、访问次数和内容哈希
+
+动态记忆不会再无条件取“最近 8 条”。每个请求会按当前问题自动召回 Top-K，并把结果放进明确标注为 untrusted data 的动态 Prompt；模型觉得候选不足时，还可以调用 `search_memory` 深搜。写入端会拒绝空值/超长值，通过规范化哈希去重，并按项目容量淘汰低价值记录。
+
+Prompt 分为可缓存的静态前缀和逐请求重建的动态后缀。静态前缀承载身份、规则和项目指令；动态后缀承载当前时间、cwd、模型、工具以及与当前问题相关的记忆。
+
+可用输入预算按 `context_window - max_output_tokens - reserve_tokens` 计算。默认在该预算的 80% 触发压缩，压到 55% 左右，为后续输出、工具结果和无 tokenizer 估算误差留出空间。压缩摘要只属于短期会话，不会自动晋升为长期记忆。
+
+## 模型、Token 与费用
+
+默认 provider/model 是 `deepseek/deepseek-v4-flash`。DeepSeek V4 Flash/Pro 的内置 profile 使用 1M 上下文，并带有截至 2026-07-17 的官方每百万 Token 价格；价格会变化，因此可以用 `llm.context_window` 和 `llm.prices` 覆盖，未知 OpenAI-compatible 模型应显式配置。
+
+流式请求开启 `stream_options.include_usage`，并解析 `choices=[]` 的 usage-only 块、cache hit/miss 和 reasoning Token。REPL 用 `/usage` 查看最近一次普通 ReAct，单次 CLI 用 `--json` 获取完整 usage/cost。成本以供应商返回的实际 Token 为准，不能只用“代码行数”精确推算。
 
 ## 联网工具
 
@@ -295,11 +361,19 @@ curl -sS http://127.0.0.1:8080/v1/threads/<thread_id>/events \
 curl -sS -X POST http://127.0.0.1:8080/v1/tasks \
   -H 'content-type: application/json' \
   -H 'x-api-key: dev-key' \
-  -d '{"message":"后台总结这个仓库"}'
+  -d '{"message":"后台总结这个仓库","mode":"plan"}'
 
 curl -sS http://127.0.0.1:8080/v1/tasks \
   -H 'x-api-key: dev-key'
 ```
+
+也可以只启动队列消费者，不暴露 HTTP：
+
+```bash
+uv run paicli worker --workers 2 --cwd .
+```
+
+任务队列按项目目录隔离；worker 使用 SQLite 原子事务领取任务，并通过 lease/heartbeat 恢复崩溃任务。运行中取消会阻止 worker 把迟到结果重新覆盖为 completed。
 
 ## 图片输入
 

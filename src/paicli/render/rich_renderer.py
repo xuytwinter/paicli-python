@@ -24,6 +24,7 @@ class RichRenderer:
         self.console = console or Console()
         self._buffer: list[str] = []
         self._thinking_buffer: list[str] = []
+        self._thinking_scope: str | None = None
         self._live_markdown = live_markdown
         self._live: Live | None = None
         self._thinking_live: Live | None = None
@@ -42,6 +43,7 @@ class RichRenderer:
     def start_run(self) -> None:
         self._buffer.clear()
         self._thinking_buffer.clear()
+        self._thinking_scope = None
         self._stop_live_markdown()
         self._stop_live_thinking()
         self._input_tokens = 0
@@ -96,9 +98,28 @@ class RichRenderer:
             self._buffer.append(text)
             self._update_live_markdown()
         elif event_type == "thinking_delta":
+            scope = _thinking_scope(event)
+            if self._thinking_buffer and scope != self._thinking_scope:
+                self._flush_thinking()
+            self._thinking_scope = scope
             thinking = str(event.get("thinking") or "")
             self._thinking_buffer.append(thinking)
             self._update_live_thinking()
+        elif event_type == "plan_status":
+            self._flush_thinking()
+            self._flush_markdown(title="Plan")
+        elif event_type == "plan_task_started":
+            self._flush_thinking()
+            self._flush_markdown(title="Plan")
+            task_id = str(event.get("task_id") or "task")
+            description = str(event.get("task_description") or "")
+            self.console.print(
+                _output_panel(
+                    Text(description, style="#e5e7eb"),
+                    title=Text(f"Running {task_id}", style="bold #22d3ee"),
+                    border_style="#0891b2",
+                )
+            )
         elif event_type == "usage":
             self._record_usage(event.get("usage") or {})
         elif event_type == "turn_complete":
@@ -180,25 +201,27 @@ class RichRenderer:
             return
         text = "".join(self._thinking_buffer)
         self._thinking_buffer.clear()
+        scope = self._thinking_scope
+        self._thinking_scope = None
         self._stop_live_thinking()
         if text.strip():
             self.console.print(
                 _output_panel(
                     Text(text, style="dim"),
-                    title=Text("Thinking", style="bold #c084fc"),
+                    title=Text(_thinking_title(scope), style="bold #c084fc"),
                     border_style="#6d28d9",
                 )
             )
 
     def _update_live_thinking(self) -> None:
-        if not self._live_markdown or not self.console.is_terminal:
+        if not self.console.is_terminal:
             return
         text = "".join(self._thinking_buffer)
         if not text.strip():
             return
         renderable = _output_panel(
             Text(text, style="dim"),
-            title=Text("Thinking", style="bold #c084fc"),
+            title=Text(_thinking_title(self._thinking_scope), style="bold #c084fc"),
             border_style="#6d28d9",
         )
         if self._thinking_live is None:
@@ -238,7 +261,7 @@ class RichRenderer:
         self.console.print(
             _output_panel(
                 body,
-                title=Text("Tool Use", style="bold #facc15"),
+                title=Text(_scoped_title("Tool Use", event), style="bold #facc15"),
                 border_style="#facc15",
             )
         )
@@ -255,7 +278,10 @@ class RichRenderer:
         self.console.print(
             _output_panel(
                 result or "(empty result)",
-                title=Text(f"Tool Result · {name} · {status}", style=title_style),
+                title=Text(
+                    _scoped_title(f"Tool Result · {name} · {status}", event),
+                    style=title_style,
+                ),
                 border_style=border_style,
             )
         )
@@ -327,6 +353,28 @@ def _format_payload(payload: Any) -> str:
         return json.dumps(payload, ensure_ascii=False, indent=2)
     except TypeError:
         return str(payload)
+
+
+def _thinking_scope(event: dict[str, Any]) -> str | None:
+    task_id = str(event.get("task_id") or "").strip()
+    if task_id:
+        return task_id
+    if event.get("phase") == "planning":
+        return "planning"
+    return None
+
+
+def _thinking_title(scope: str | None) -> str:
+    if scope == "planning":
+        return "Thinking · planning"
+    if scope:
+        return f"Thinking · {scope}"
+    return "Thinking"
+
+
+def _scoped_title(title: str, event: dict[str, Any]) -> str:
+    task_id = str(event.get("task_id") or "").strip()
+    return f"{title} · {task_id}" if task_id else title
 
 
 def _output_panel(renderable: Any, *, title: Text, border_style: str) -> Panel:

@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import glob as glob_module
 import os
-import re
-from pathlib import Path
 from typing import Any
 
-from paicli.lsp import diagnose_file
 from paicli.memory import MemoryManager
-from paicli.policy import CommandGuard, PathGuard
+from paicli.policy import CommandGuard
 from paicli.rag import CodeIndex
 from paicli.skill import SkillRegistry
 from paicli.snapshot import SnapshotService
+from paicli.tools import file_ops as fops
 from paicli.tools.base import Tool, ToolContext, ToolResult, object_schema
+from paicli.tools.file_ops import FileOpResult
 from paicli.web import fetch_url, search_web
 
 
@@ -31,7 +29,7 @@ def get_builtin_tools() -> list[Tool]:
                 ["path"],
             ),
             required_keys=["path"],
-            handler=read_file,
+            handler=_read_file,
         ),
         Tool(
             name="write_file",
@@ -45,7 +43,37 @@ def get_builtin_tools() -> list[Tool]:
                 ["path", "content"],
             ),
             required_keys=["path", "content"],
-            handler=write_file,
+            handler=_write_file,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
+        ),
+        Tool(
+            name="edit_file",
+            description=(
+                "Make line-based edits to a text file. Each edit replaces exact line sequences "
+                "with new content. Returns a git-style diff showing the changes made."
+            ),
+            parameters=object_schema(
+                {
+                    "path": {"type": "string", "description": "File path to edit"},
+                    "old_text": {
+                        "type": "string",
+                        "description": "Text to search for — must match exactly",
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Text to replace with",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Preview changes without modifying the file",
+                    },
+                },
+                ["path", "old_text", "new_text"],
+            ),
+            required_keys=["path", "old_text", "new_text"],
+            handler=_edit_file,
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="medium",
@@ -58,7 +86,7 @@ def get_builtin_tools() -> list[Tool]:
                 ["path"],
             ),
             required_keys=["path"],
-            handler=list_dir,
+            handler=_list_dir,
         ),
         Tool(
             name="glob",
@@ -71,7 +99,7 @@ def get_builtin_tools() -> list[Tool]:
                 ["pattern"],
             ),
             required_keys=["pattern"],
-            handler=glob_files,
+            handler=_glob_files,
         ),
         Tool(
             name="glob_files",
@@ -84,7 +112,7 @@ def get_builtin_tools() -> list[Tool]:
                 ["pattern"],
             ),
             required_keys=["pattern"],
-            handler=glob_files,
+            handler=_glob_files,
         ),
         Tool(
             name="grep",
@@ -99,7 +127,7 @@ def get_builtin_tools() -> list[Tool]:
                 ["pattern"],
             ),
             required_keys=["pattern"],
-            handler=grep,
+            handler=_grep,
         ),
         Tool(
             name="grep_code",
@@ -114,7 +142,47 @@ def get_builtin_tools() -> list[Tool]:
                 ["pattern"],
             ),
             required_keys=["pattern"],
-            handler=grep,
+            handler=_grep,
+        ),
+        Tool(
+            name="directory_tree",
+            description=(
+                "Get a recursive tree view of files and directories as indented text. "
+                "Each entry shows the name and type. Files have no children, "
+                "while directories always show their contents."
+            ),
+            parameters=object_schema(
+                {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path (default: workspace root)",
+                    },
+                    "max_depth": {
+                        "type": "number",
+                        "description": "Maximum recursion depth (default: 3)",
+                    },
+                    "exclude_patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Directory names to exclude from the tree",
+                    },
+                },
+            ),
+            required_keys=[],
+            handler=_directory_tree,
+        ),
+        Tool(
+            name="get_file_info",
+            description=(
+                "Retrieve detailed metadata about a file or directory — size, "
+                "modification time, permissions, and type."
+            ),
+            parameters=object_schema(
+                {"path": {"type": "string", "description": "Path to inspect"}},
+                ["path"],
+            ),
+            required_keys=["path"],
+            handler=_get_file_info,
         ),
         Tool(
             name="bash",
@@ -127,7 +195,7 @@ def get_builtin_tools() -> list[Tool]:
                 ["command"],
             ),
             required_keys=["command"],
-            handler=bash,
+            handler=_bash,
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="high",
@@ -144,7 +212,7 @@ def get_builtin_tools() -> list[Tool]:
                 ["command"],
             ),
             required_keys=["command"],
-            handler=bash,
+            handler=_bash,
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="high",
@@ -163,7 +231,7 @@ def get_builtin_tools() -> list[Tool]:
                 ["query"],
             ),
             required_keys=["query"],
-            handler=web_search,
+            handler=_web_search,
         ),
         Tool(
             name="web_fetch",
@@ -176,20 +244,57 @@ def get_builtin_tools() -> list[Tool]:
                 ["url"],
             ),
             required_keys=["url"],
-            handler=web_fetch,
+            handler=_web_fetch,
         ),
         Tool(
             name="save_memory",
-            description="Save a stable fact to long-term project memory.",
+            description=(
+                "Save an explicit or durable fact to long-term project memory. Use only for stable "
+                "preferences, project constraints, user corrections, or reusable decisions; never "
+                "store secrets, temporary task state, raw logs, or uncertain claims."
+            ),
             parameters=object_schema(
-                {"content": {"type": "string", "description": "Fact to remember"}},
+                {
+                    "content": {"type": "string", "description": "Durable fact to remember"},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "preference", "constraint", "correction", "decision"],
+                    },
+                    "importance": {"type": "number", "description": "Score from 0 to 1"},
+                    "confidence": {"type": "number", "description": "Score from 0 to 1"},
+                    "expires_at": {
+                        "type": "string",
+                        "description": "Optional ISO-8601 expiry for time-sensitive memory",
+                    },
+                },
                 ["content"],
             ),
             required_keys=["content"],
-            handler=save_memory,
+            handler=_save_memory,
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="medium",
+        ),
+        Tool(
+            name="search_memory",
+            description=(
+                "Search relevance-ranked long-term project memory when prior preferences, "
+                "corrections, constraints, or decisions may matter."
+            ),
+            parameters=object_schema(
+                {
+                    "query": {"type": "string", "description": "What to recall"},
+                    "limit": {"type": "number", "description": "Maximum results"},
+                    "kinds": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional memory kinds",
+                    },
+                },
+                ["query"],
+            ),
+            required_keys=["query"],
+            handler=_search_memory,
         ),
         Tool(
             name="load_skill",
@@ -199,7 +304,45 @@ def get_builtin_tools() -> list[Tool]:
                 ["name"],
             ),
             required_keys=["name"],
-            handler=load_skill,
+            handler=_load_skill,
+        ),
+        Tool(
+            name="save_skill",
+            description=(
+                "Persist a reusable PaiCLI workflow as a project or user skill after user approval."
+            ),
+            parameters=object_schema(
+                {
+                    "name": {"type": "string", "description": "Lowercase skill slug"},
+                    "description": {
+                        "type": "string",
+                        "description": "When this skill should be used",
+                    },
+                    "content": {"type": "string", "description": "Reusable skill instructions"},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "user"],
+                        "description": "Where to persist the skill",
+                    },
+                    "version": {"type": "string", "description": "Skill version"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Matching keywords",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Update an existing skill instead of failing",
+                    },
+                },
+                ["name", "description", "content"],
+            ),
+            required_keys=["name", "description", "content"],
+            handler=_save_skill,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
+            requires_approval=True,
         ),
         Tool(
             name="search_code",
@@ -212,7 +355,7 @@ def get_builtin_tools() -> list[Tool]:
                 ["query"],
             ),
             required_keys=["query"],
-            handler=search_code,
+            handler=_search_code,
         ),
         Tool(
             name="revert_turn",
@@ -222,7 +365,7 @@ def get_builtin_tools() -> list[Tool]:
                 ["snapshot"],
             ),
             required_keys=["snapshot"],
-            handler=revert_turn,
+            handler=_revert_turn,
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="high",
@@ -232,95 +375,104 @@ def get_builtin_tools() -> list[Tool]:
     return tools
 
 
-async def read_file(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    path = _resolve_path(context, str(payload["path"]))
-    offset = max(int(payload.get("offset") or 1), 1)
-    limit = int(payload.get("limit") or 500)
-    content = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    selected = content[offset - 1 : offset - 1 + limit]
-    numbered = "\n".join(f"{idx + offset}: {line}" for idx, line in enumerate(selected))
-    return ToolResult(numbered, display_summary=f"Read {path.relative_to(context.cwd)}")
+# ---------------------------------------------------------------------------
+# Handler: file operations (thin wrappers over file_ops)
+# ---------------------------------------------------------------------------
 
 
-async def write_file(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    path = _resolve_path(context, str(payload["path"]))
-    content = str(payload["content"])
-    if len(content.encode("utf-8")) > 5 * 1024 * 1024:
-        return ToolResult("write_file rejected: content exceeds 5MB", is_error=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = "a" if payload.get("append") else "w"
-    with path.open(mode, encoding="utf-8") as handle:
-        handle.write(content)
-    rel = path.relative_to(context.cwd)
-    diagnostics = diagnose_file(path)
-    suffix = ""
-    if diagnostics:
-        suffix = "\n\nDiagnostics:\n" + "\n".join(diagnostics)
-    return ToolResult(f"Wrote {rel}{suffix}", display_summary=f"Wrote {rel}")
+async def _read_file(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    result: FileOpResult = fops.read_file(
+        context.cwd,
+        str(payload["path"]),
+        offset=int(payload.get("offset") or 1),
+        limit=int(payload.get("limit") or 500),
+        path_guard_enabled=context.config.policy.path_guard_enabled,
+    )
+    return _to_tool_result(result)
 
 
-async def list_dir(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    path = _resolve_path(context, str(payload["path"]))
-    if not path.is_dir():
-        return ToolResult(f"Not a directory: {path}", is_error=True)
-    rows = []
-    for child in sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
-        marker = "/" if child.is_dir() else ""
-        rows.append(f"{child.name}{marker}")
-    return ToolResult("\n".join(rows) or "(empty directory)")
+async def _write_file(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    result: FileOpResult = fops.write_file(
+        context.cwd,
+        str(payload["path"]),
+        str(payload["content"]),
+        append=bool(payload.get("append")),
+        path_guard_enabled=context.config.policy.path_guard_enabled,
+    )
+    return _to_tool_result(result)
 
 
-async def glob_files(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    root = Path(context.cwd).resolve()
-    pattern = str(payload["pattern"])
-    if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
-        return ToolResult("glob pattern must stay inside workspace", is_error=True)
-    limit = int(payload.get("limit") or 100)
-    matches = glob_module.glob(str(root / pattern), recursive=True)
-    rels = []
-    for match in sorted(matches):
-        path = Path(match).resolve()
-        try:
-            rels.append(str(path.relative_to(root)))
-        except ValueError:
-            continue
-        if len(rels) >= limit:
-            break
-    return ToolResult("\n".join(rels) or "(no matches)")
+async def _edit_file(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    result: FileOpResult = fops.edit_file(
+        context.cwd,
+        str(payload["path"]),
+        str(payload["old_text"]),
+        str(payload["new_text"]),
+        path_guard_enabled=context.config.policy.path_guard_enabled,
+        dry_run=bool(payload.get("dry_run")),
+    )
+    return _to_tool_result(result)
 
 
-async def grep(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    root = Path(context.cwd).resolve()
-    start = _resolve_path(context, str(payload.get("path") or "."))
-    pattern = str(payload["pattern"])
-    limit = int(payload.get("limit") or 100)
-    use_regex = bool(payload.get("regex", True))
-    try:
-        compiled = re.compile(pattern) if use_regex else None
-    except re.error as exc:
-        return ToolResult(f"invalid regex: {exc}", is_error=True)
-
-    matches: list[str] = []
-    files = [start] if start.is_file() else [p for p in start.rglob("*") if p.is_file()]
-    for file_path in files:
-        if _skip_file(file_path):
-            continue
-        try:
-            lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            continue
-        for line_number, line in enumerate(lines, start=1):
-            found = bool(compiled.search(line)) if compiled else pattern in line
-            if found:
-                matches.append(f"{file_path.relative_to(root)}:{line_number}: {line.strip()}")
-                if len(matches) >= limit:
-                    return ToolResult("\n".join(matches))
-    return ToolResult("\n".join(matches) or "(no matches)")
+async def _list_dir(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    result: FileOpResult = fops.list_directory(
+        context.cwd,
+        str(payload["path"]),
+        path_guard_enabled=context.config.policy.path_guard_enabled,
+    )
+    return _to_tool_result(result)
 
 
-async def bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+async def _glob_files(payload: dict[str, Any], _context: ToolContext) -> ToolResult:
+    result: FileOpResult = fops.glob_files(
+        _context.cwd,
+        str(payload["pattern"]),
+        limit=int(payload.get("limit") or 100),
+    )
+    return _to_tool_result(result)
+
+
+async def _grep(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    result: FileOpResult = fops.grep(
+        context.cwd,
+        str(payload["pattern"]),
+        path=str(payload.get("path") or "."),
+        limit=int(payload.get("limit") or 100),
+        use_regex=bool(payload.get("regex", True)),
+        path_guard_enabled=context.config.policy.path_guard_enabled,
+    )
+    return _to_tool_result(result)
+
+
+async def _directory_tree(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    result: FileOpResult = fops.directory_tree(
+        context.cwd,
+        str(payload.get("path", ".")),
+        max_depth=int(payload.get("max_depth") or 3),
+        path_guard_enabled=context.config.policy.path_guard_enabled,
+        exclude_patterns=tuple(payload.get("exclude_patterns") or ()),
+    )
+    return _to_tool_result(result)
+
+
+async def _get_file_info(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    result: FileOpResult = fops.get_file_info(
+        context.cwd,
+        str(payload["path"]),
+        path_guard_enabled=context.config.policy.path_guard_enabled,
+    )
+    return _to_tool_result(result)
+
+
+# ---------------------------------------------------------------------------
+# Handler: bash
+# ---------------------------------------------------------------------------
+
+
+async def _bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     command = str(payload["command"])
-    CommandGuard(context.config.policy.command_blacklist).validate(command)
+    if context.config.policy.command_guard_enabled:
+        CommandGuard(context.config.policy.command_blacklist).validate(command)
     timeout = float(payload.get("timeout") or context.config.tools.timeout)
     proc = await asyncio.create_subprocess_shell(
         command,
@@ -344,7 +496,12 @@ async def bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     )
 
 
-async def web_search(payload: dict[str, Any], _context: ToolContext) -> ToolResult:
+# ---------------------------------------------------------------------------
+# Handler: web
+# ---------------------------------------------------------------------------
+
+
+async def _web_search(payload: dict[str, Any], _context: ToolContext) -> ToolResult:
     max_results = int(payload.get("max_results") or payload.get("maxResults") or 5)
     try:
         results = await search_web(str(payload["query"]), max_results=max_results)
@@ -359,7 +516,7 @@ async def web_search(payload: dict[str, Any], _context: ToolContext) -> ToolResu
     return ToolResult(content, display_summary=f"Search: {len(results)} results")
 
 
-async def web_fetch(payload: dict[str, Any], _context: ToolContext) -> ToolResult:
+async def _web_fetch(payload: dict[str, Any], _context: ToolContext) -> ToolResult:
     max_length = int(payload.get("max_length") or payload.get("maxLength") or 10_000)
     try:
         content = await fetch_url(str(payload["url"]), max_length=max_length)
@@ -368,15 +525,70 @@ async def web_fetch(payload: dict[str, Any], _context: ToolContext) -> ToolResul
     return ToolResult(content, display_summary=f"Fetched {payload['url']}")
 
 
-async def save_memory(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+# ---------------------------------------------------------------------------
+# Handler: memory
+# ---------------------------------------------------------------------------
+
+
+async def _save_memory(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     if not context.config.features.memory or not context.config.memory.long_term_enabled:
         return ToolResult("Long-term memory is disabled.", is_error=True)
-    manager = MemoryManager(context.config.memory.long_term_db_path, scope=context.cwd)
-    memory_id = manager.save(str(payload["content"]))
+    manager = MemoryManager(
+        context.config.memory.long_term_db_path,
+        scope=context.cwd,
+        max_entries=context.config.memory.max_long_term_entries,
+        max_content_length=context.config.memory.max_memory_chars,
+    )
+    memory_id = manager.save(
+        str(payload["content"]),
+        kind=str(payload.get("kind") or "fact"),
+        source="agent",
+        importance=float(payload.get("importance", 0.5)),
+        confidence=float(payload.get("confidence", 1.0)),
+        expires_at=payload.get("expires_at"),
+    )
     return ToolResult(f"Saved memory #{memory_id}")
 
 
-async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+async def _search_memory(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    if not context.config.features.memory or not context.config.memory.long_term_enabled:
+        return ToolResult("Long-term memory is disabled.", is_error=True)
+    raw_kinds = payload.get("kinds")
+    if raw_kinds is not None and not isinstance(raw_kinds, list):
+        return ToolResult("search_memory kinds must be an array of strings.", is_error=True)
+    manager = MemoryManager(
+        context.config.memory.long_term_db_path,
+        scope=context.cwd,
+        max_entries=context.config.memory.max_long_term_entries,
+        max_content_length=context.config.memory.max_memory_chars,
+    )
+    rows = manager.recall(
+        str(payload["query"]),
+        limit=int(payload.get("limit") or context.config.memory.recall_limit),
+        kinds=[str(kind) for kind in raw_kinds] if raw_kinds else None,
+        min_score=context.config.memory.recall_min_score,
+    )
+    if not rows:
+        return ToolResult("(no relevant long-term memory)")
+    content = "\n".join(
+        f"#{row.id} [{row.kind}, importance={row.importance:.2f}] {row.content}" for row in rows
+    )
+    return ToolResult(content, display_summary=f"Recalled {len(rows)} memories")
+
+
+# Keep the original handler imports working for SDK users and existing tests.
+save_memory = _save_memory
+search_memory = _search_memory
+
+
+# ---------------------------------------------------------------------------
+# Handler: skill
+# ---------------------------------------------------------------------------
+
+
+async def _load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    if not context.config.features.skill:
+        return ToolResult("Skills are disabled.", is_error=True)
     skill = SkillRegistry(context.cwd).load(str(payload["name"]))
     if not skill:
         return ToolResult(f'Skill "{payload["name"]}" not found or disabled.', is_error=True)
@@ -392,7 +604,52 @@ async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResul
     return ToolResult(content, display_summary=f"Loaded skill {skill.name}")
 
 
-async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+async def _save_skill(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    if not context.config.features.skill:
+        return ToolResult("Skills are disabled.", is_error=True)
+    raw_tags = payload.get("tags") or []
+    if not isinstance(raw_tags, list):
+        return ToolResult("save_skill tags must be an array of strings.", is_error=True)
+    tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
+    registry = SkillRegistry(context.cwd)
+    scope = str(payload.get("scope") or "project")
+    name = str(payload["name"])
+    try:
+        if bool(payload.get("overwrite")):
+            skill = registry.update(
+                name,
+                description=str(payload["description"]),
+                body=str(payload["content"]),
+                scope=scope,
+                version=str(payload.get("version") or "1.0.0"),
+                tags=tags,
+            )
+        else:
+            skill = registry.create(
+                name,
+                description=str(payload["description"]),
+                body=str(payload["content"]),
+                scope=scope,
+                version=str(payload.get("version") or "1.0.0"),
+                tags=tags,
+            )
+    except (OSError, ValueError) as exc:
+        return ToolResult(f"save_skill failed: {exc}", is_error=True)
+    return ToolResult(
+        f'Saved skill "{skill.name}" in {scope} scope at {skill.path}.',
+        display_summary=f"Saved skill {skill.name}",
+    )
+
+
+load_skill = _load_skill
+
+
+# ---------------------------------------------------------------------------
+# Handler: code search
+# ---------------------------------------------------------------------------
+
+
+async def _search_code(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     index = CodeIndex(context.cwd)
     results = index.search(str(payload["query"]), limit=int(payload.get("limit") or 20))
     if not results:
@@ -400,20 +657,25 @@ async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResu
     return ToolResult("\n".join(f"{item.path}:{item.line}: {item.snippet}" for item in results))
 
 
-async def revert_turn(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+# ---------------------------------------------------------------------------
+# Handler: snapshot revert
+# ---------------------------------------------------------------------------
+
+
+async def _revert_turn(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     record = SnapshotService(context.cwd).restore(str(payload["snapshot"]))
     return ToolResult(f"Restored snapshot {record.id}")
 
 
-def _resolve_path(context: ToolContext, value: str) -> Path:
-    if context.config.policy.path_guard_enabled:
-        return PathGuard(context.cwd).validate(value)
-    path = Path(value)
-    return path if path.is_absolute() else Path(context.cwd).resolve() / path
+# ---------------------------------------------------------------------------
+# Conversion helper
+# ---------------------------------------------------------------------------
 
 
-def _skip_file(path: Path) -> bool:
-    skip_dirs = {".git", ".venv", "node_modules", "dist", "build", "target"}
-    if any(part in skip_dirs for part in path.parts):
-        return True
-    return path.stat().st_size > 1_000_000
+def _to_tool_result(result: FileOpResult) -> ToolResult:
+    """Convert a FileOpResult to a ToolResult."""
+    return ToolResult(
+        content=result.content,
+        is_error=result.is_error,
+        display_summary=result.display_summary,
+    )

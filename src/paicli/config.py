@@ -19,6 +19,10 @@ class LlmConfig:
     model: str = "deepseek-v4-flash"
     api_key: str = ""
     base_url: str | None = None
+    context_window: int | None = None
+    # Optional per-million-token overrides, keyed by currency then
+    # input_cache_hit/input_cache_miss/output. Provider prices can change.
+    prices: dict[str, dict[str, float]] = field(default_factory=dict)
     max_tokens: int = 8192
     temperature: float = 0.7
     timeout: float = 120.0
@@ -44,14 +48,23 @@ class MemoryConfig:
     max_conversation_history: int = 100
     long_term_enabled: bool = True
     long_term_db_path: str = "~/.paicli/memory.db"
+    max_long_term_entries: int = 1_000
+    max_memory_chars: int = 8_000
+    recall_limit: int = 6
+    recall_min_score: float = 0.05
     token_budget_mode: str = "balanced"
     compression_threshold: float = 0.8
+    compression_target: float = 0.55
+    compression_reserve_tokens: int = 1_024
+    min_recent_messages: int = 6
+    summary_max_chars: int = 6_000
 
 
 @dataclass(slots=True)
 class PolicyConfig:
     hitl_mode: str = "auto"
     path_guard_enabled: bool = True
+    command_guard_enabled: bool = True
     command_blacklist: list[str] = field(
         default_factory=lambda: [
             "sudo",
@@ -188,6 +201,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("PAICLI_PROVIDER", "provider", str),
         ("PAICLI_MODEL", "model", str),
         ("PAICLI_BASE_URL", "base_url", str),
+        ("PAICLI_CONTEXT_WINDOW", "context_window", int),
         ("PAICLI_MAX_TOKENS", "max_tokens", int),
         ("PAICLI_TEMPERATURE", "temperature", float),
     ]
@@ -200,19 +214,20 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     provider = str(llm.get("provider") or "").lower()
     if not llm.get("api_key"):
         provider_key_map = {
-            "deepseek": "DEEPSEEK_API_KEY",
-            "glm": "GLM_API_KEY",
-            "zhipu": "GLM_API_KEY",
-            "step": "STEP_API_KEY",
-            "kimi": "KIMI_API_KEY",
-            "moonshot": "KIMI_API_KEY",
-            "freellmapi": "FREELLMAPI_API_KEY",
-            "xfyun": "XFYUN_API_KEY",
-            "agnes": "AGNES_API_KEY",
+            "deepseek": ("DEEPSEEK_API_KEY",),
+            "glm": ("ZAI_API_KEY", "GLM_API_KEY"),
+            "zhipu": ("ZAI_API_KEY", "GLM_API_KEY"),
+            "step": ("STEP_API_KEY",),
+            "kimi": ("KIMI_API_KEY",),
+            "moonshot": ("KIMI_API_KEY",),
+            "freellmapi": ("FREELLMAPI_API_KEY",),
+            "xfyun": ("XFYUN_API_KEY",),
+            "agnes": ("AGNES_API_KEY",),
         }
-        provider_key = provider_key_map.get(provider)
-        if provider_key and env.get(provider_key):
-            llm["api_key"] = env[provider_key]
+        for provider_key in provider_key_map.get(provider, ()):
+            if env.get(provider_key):
+                llm["api_key"] = env[provider_key]
+                break
 
     provider_model_key = f"{provider.upper()}_MODEL" if provider else ""
     provider_base_url_key = f"{provider.upper()}_BASE_URL" if provider else ""

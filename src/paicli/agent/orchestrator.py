@@ -5,7 +5,7 @@ import json
 import re
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
@@ -16,7 +16,7 @@ from paicli.prompt import PromptAssembler
 from paicli.skill import SkillContextBuffer
 from paicli.snapshot import SnapshotService
 from paicli.tools.registry import ToolRegistry
-from paicli.types import Message
+from paicli.types import Message, Usage
 
 
 class AgentRole(StrEnum):
@@ -41,24 +41,45 @@ class StepStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class AgentRunMode(StrEnum):
+    REACT = "react"
+    PLAN = "plan"
+
+
 @dataclass(slots=True)
 class AgentMessage:
     from_agent: str
     from_role: AgentRole | None
     content: str
     type: AgentMessageType
+    usage: Usage = field(default_factory=Usage)
+    turns: int = 0
 
     @classmethod
     def task(cls, from_agent: str, content: str) -> AgentMessage:
         return cls(from_agent, None, content, AgentMessageType.TASK)
 
     @classmethod
-    def result(cls, from_agent: str, role: AgentRole, content: str) -> AgentMessage:
-        return cls(from_agent, role, content, AgentMessageType.RESULT)
+    def result(
+        cls,
+        from_agent: str,
+        role: AgentRole,
+        content: str,
+        usage: Usage | None = None,
+        turns: int = 0,
+    ) -> AgentMessage:
+        return cls(from_agent, role, content, AgentMessageType.RESULT, usage or Usage(), turns)
 
     @classmethod
-    def error(cls, from_agent: str, role: AgentRole, content: str) -> AgentMessage:
-        return cls(from_agent, role, content, AgentMessageType.ERROR)
+    def error(
+        cls,
+        from_agent: str,
+        role: AgentRole,
+        content: str,
+        usage: Usage | None = None,
+        turns: int = 0,
+    ) -> AgentMessage:
+        return cls(from_agent, role, content, AgentMessageType.ERROR, usage or Usage(), turns)
 
 
 @dataclass(slots=True)
@@ -67,6 +88,7 @@ class ExecutionStep:
     description: str
     type: str
     dependencies: list[str]
+    mode: str = AgentRunMode.REACT.value
     result: str = ""
     status: StepStatus = StepStatus.PENDING
 
@@ -92,6 +114,8 @@ class SubAgent:
         cwd: str,
         approval_callback=None,
         skill_context_buffer: SkillContextBuffer | None = None,
+        default_mode: str = AgentRunMode.REACT.value,
+        max_plan_depth: int = 1,
     ):
         self.name = name
         self.role = role
@@ -101,11 +125,23 @@ class SubAgent:
         self.cwd = cwd
         self.approval_callback = approval_callback
         self.skill_context_buffer = skill_context_buffer or SkillContextBuffer()
+        self.default_mode = _normalize_worker_mode(default_mode)
+        self.max_plan_depth = max(1, max_plan_depth)
         self.history: list[Message] = []
 
-    async def execute(self, task: AgentMessage, context: str = "") -> AgentMessage:
+    async def execute(
+        self,
+        task: AgentMessage,
+        context: str = "",
+        *,
+        mode: str | None = None,
+        plan_depth: int = 0,
+    ) -> AgentMessage:
         content = f"{context}\n\nCurrent task:\n{task.content}".strip() if context else task.content
         if self.role == AgentRole.WORKER:
+            selected_mode = _normalize_worker_mode(mode or self.default_mode)
+            if selected_mode == AgentRunMode.PLAN:
+                return await self._execute_plan(content, plan_depth=plan_depth)
             return await self._execute_worker(content)
         return await self._execute_without_tools(content)
 
@@ -119,10 +155,13 @@ class SubAgent:
 
     def clear_history(self) -> None:
         self.history = []
+        self.skill_context_buffer.clear()
 
     async def _execute_worker(self, content: str) -> AgentMessage:
         text = ""
         tool_results: list[str] = []
+        usage = Usage()
+        turns = 0
         try:
             async for event in query(
                 llm_client=self.llm_client,
@@ -142,15 +181,54 @@ class SubAgent:
                     tool_results.append(str(event.get("result") or ""))
                 elif event.get("type") == "done":
                     self.history = list(event.get("messages") or [])
+                    usage = usage + Usage.from_mapping(event.get("usage") or {})
+                    turns += int(event.get("total_turns") or 0)
                 elif event.get("type") == "error":
                     raise event["error"]
         except Exception as exc:  # noqa: BLE001
-            return AgentMessage.error(self.name, self.role, str(exc))
+            return AgentMessage.error(self.name, self.role, str(exc), usage, turns)
         result = text.strip() or "\n".join(item for item in tool_results if item).strip()
-        return AgentMessage.result(self.name, self.role, result)
+        return AgentMessage.result(self.name, self.role, result, usage, turns)
+
+    async def _execute_plan(self, content: str, *, plan_depth: int) -> AgentMessage:
+        if plan_depth >= self.max_plan_depth:
+            return AgentMessage.error(
+                self.name,
+                self.role,
+                f"nested Plan depth limit ({self.max_plan_depth}) reached",
+            )
+        from paicli.agent.plan_execute import PlanExecuteAgent
+
+        agent = PlanExecuteAgent(
+            llm_client=self.llm_client,
+            tool_registry=self.tool_registry,
+            config=self.config,
+            cwd=self.cwd,
+            approval_callback=self.approval_callback,
+        )
+        text = ""
+        usage = Usage()
+        turns = 0
+        try:
+            async for event in agent.run(content):
+                if event.get("type") == "text_delta":
+                    text += str(event.get("text") or "")
+                elif event.get("type") == "done":
+                    usage = usage + Usage.from_mapping(event.get("usage") or {})
+                    turns += int(event.get("total_turns") or 0)
+                elif event.get("type") == "error":
+                    raise event["error"]
+        except Exception as exc:  # noqa: BLE001
+            return AgentMessage.error(self.name, self.role, str(exc), usage, turns)
+        self.history = [
+            Message(role="user", content=content),
+            Message(role="assistant", content=text),
+        ]
+        return AgentMessage.result(self.name, self.role, text.strip(), usage, turns)
 
     async def _execute_without_tools(self, content: str) -> AgentMessage:
         text = ""
+        usage = Usage()
         messages = [*self.history, Message(role="user", content=content)]
         try:
             async for event in self.llm_client.chat(
@@ -160,12 +238,14 @@ class SubAgent:
             ):
                 if event.get("type") == "text_delta":
                     text += str(event.get("text") or "")
+                elif event.get("type") == "usage":
+                    usage = usage + Usage.from_mapping(event.get("usage") or {})
                 elif event.get("type") == "error":
                     raise event["error"]
         except Exception as exc:  # noqa: BLE001
-            return AgentMessage.error(self.name, self.role, str(exc))
+            return AgentMessage.error(self.name, self.role, str(exc), usage, 1)
         self.history = [*messages, Message(role="assistant", content=text)]
-        return AgentMessage.result(self.name, self.role, text)
+        return AgentMessage.result(self.name, self.role, text, usage, 1)
 
     def _system_prompt(self) -> str:
         base = PromptAssembler(
@@ -174,11 +254,12 @@ class SubAgent:
             tool_names=self.tool_registry.list_names(),
             model=self.llm_client.model_name,
             provider=self.llm_client.provider_name,
-        ).build()
+        ).build_static()
         role_prompt = {
             AgentRole.PLANNER: (
                 "You are the Planner in a multi-agent workflow. Return only JSON with a "
-                "steps array. Each step needs id, description, type, and dependencies."
+                "steps array. Each step needs id, description, type, dependencies, and optional "
+                'mode ("react" or "plan"). Use plan only when a worker needs its own nested DAG.'
             ),
             AgentRole.WORKER: (
                 "You are the Worker in a multi-agent workflow. Execute only the assigned "
@@ -204,13 +285,14 @@ class AgentOrchestrator:
         cwd: str,
         approval_callback=None,
         worker_count: int = 2,
+        default_worker_mode: str = AgentRunMode.REACT.value,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
         self.config = config
         self.cwd = cwd
         self.approval_callback = approval_callback
-        self.skill_context_buffer = SkillContextBuffer()
+        self.default_worker_mode = _normalize_worker_mode(default_worker_mode)
         self.planner = self._subagent("planner", AgentRole.PLANNER)
         self.workers = [
             self._subagent(f"worker-{index}", AgentRole.WORKER)
@@ -218,17 +300,23 @@ class AgentOrchestrator:
         ]
         self.reviewer = self._subagent("reviewer", AgentRole.REVIEWER)
         self.history: list[Message] = []
+        self.total_usage = Usage()
+        self.total_turns = 0
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
         snapshot = SnapshotService(self.cwd)
         with suppress(Exception):
             snapshot.create("pre-turn")
         final_text = ""
+        self.total_usage = Usage()
+        self.total_turns = 0
         try:
             yield {"type": "text_delta", "text": "Phase 1: planner\n\n"}
             plan_result = await self.planner.execute(
                 AgentMessage.task("orchestrator", f"Create an execution plan for:\n{message}")
             )
+            self.total_usage = self.total_usage + plan_result.usage
+            self.total_turns += plan_result.turns
             self.planner.clear_history()
             if plan_result.type == AgentMessageType.ERROR:
                 raise RuntimeError(f"planner failed: {plan_result.content}")
@@ -253,7 +341,17 @@ class AgentOrchestrator:
         finally:
             with suppress(Exception):
                 snapshot.create("post-turn")
-        yield {"type": "done", "total_turns": 0, "total_tokens": 0, "messages": self.history}
+        done: dict[str, Any] = {
+            "type": "done",
+            "total_turns": self.total_turns,
+            "total_tokens": self.total_usage.total_tokens,
+            "usage": self.total_usage.to_dict(),
+            "messages": self.history,
+        }
+        costs = _calculate_costs(self.llm_client, self.total_usage)
+        if costs:
+            done["cost"] = costs
+        yield done
 
     async def _execute_steps(
         self,
@@ -315,13 +413,17 @@ class AgentOrchestrator:
         self._update_step(steps, step.id, step.started())
         context = self.build_step_context(steps, step)
         task_msg = AgentMessage.task("orchestrator", step.description)
-        result = await worker.execute(task_msg, context)
+        result = await worker.execute(task_msg, context, mode=step.mode)
+        self.total_usage = self.total_usage + result.usage
+        self.total_turns += result.turns
         if result.type == AgentMessageType.ERROR or not result.content.strip():
             self._update_step(steps, step.id, step.with_failed(result.content or "empty result"))
             return
 
         accepted_result = result.content
         review = await reviewer.review(step.description, accepted_result)
+        self.total_usage = self.total_usage + review.usage
+        self.total_turns += review.turns
         reviewer.clear_history()
         approved = self.parse_review_approval(review.content)
         issues = self.parse_review_issues(review.content)
@@ -330,16 +432,27 @@ class AgentOrchestrator:
             retries += 1
             retry_count[step.id] = retries
             retry_context = context + f"\n\nReviewer rejected the previous result:\n{issues}"
-            retry_result = await worker.execute(task_msg, retry_context)
+            retry_result = await worker.execute(task_msg, retry_context, mode=step.mode)
+            self.total_usage = self.total_usage + retry_result.usage
+            self.total_turns += retry_result.turns
             if retry_result.type == AgentMessageType.ERROR or not retry_result.content.strip():
                 issues = retry_result.content or "empty retry result"
                 continue
             accepted_result = retry_result.content
             retry_review = await reviewer.review(step.description, accepted_result)
+            self.total_usage = self.total_usage + retry_review.usage
+            self.total_turns += retry_review.turns
             reviewer.clear_history()
             approved = self.parse_review_approval(retry_review.content)
             issues = self.parse_review_issues(retry_review.content)
 
+        if not approved:
+            self._update_step(
+                steps,
+                step.id,
+                step.with_failed(f"review rejected after {retries} retries: {issues}"),
+            )
+            return
         self._update_step(steps, step.id, step.with_result(accepted_result))
 
     def parse_plan(self, plan_json: str) -> list[ExecutionStep]:
@@ -364,6 +477,16 @@ class AgentOrchestrator:
                     description=str(node.get("description") or original_id),
                     type=str(node.get("type") or "COMMAND"),
                     dependencies=[],
+                    mode=_normalize_worker_mode(
+                        str(
+                            node.get("mode")
+                            or (
+                                AgentRunMode.PLAN.value
+                                if str(node.get("type") or "").upper() == "PLAN"
+                                else self.default_worker_mode
+                            )
+                        )
+                    ),
                 )
             )
         for index, node in enumerate(nodes, start=1):
@@ -428,7 +551,9 @@ class AgentOrchestrator:
         lines = ["Execution plan:"]
         for step in steps:
             deps = ", ".join(step.dependencies) if step.dependencies else "none"
-            lines.append(f"- [{step.id}] {step.description} ({step.type}, deps: {deps})")
+            lines.append(
+                f"- [{step.id}] {step.description} ({step.type}, mode: {step.mode}, deps: {deps})"
+            )
         return "\n".join(lines)
 
     def build_final_result(self, steps: list[ExecutionStep]) -> str:
@@ -462,7 +587,10 @@ class AgentOrchestrator:
             config=self.config,
             cwd=self.cwd,
             approval_callback=self.approval_callback,
-            skill_context_buffer=self.skill_context_buffer,
+            # Every sub-agent owns its buffer. Sharing it lets concurrent workers consume each
+            # other's loaded Skill instructions.
+            skill_context_buffer=SkillContextBuffer(),
+            default_mode=self.default_worker_mode,
         )
 
     def _update_step(
@@ -492,3 +620,23 @@ def _preview(text: str, max_len: int = 160) -> str:
     if len(value) <= max_len:
         return value
     return value[: max_len - 3] + "..."
+
+
+def _normalize_worker_mode(mode: str) -> str:
+    value = str(mode or AgentRunMode.REACT.value).strip().lower()
+    if value not in {item.value for item in AgentRunMode}:
+        raise ValueError("worker mode must be react or plan")
+    return value
+
+
+def _calculate_costs(llm_client: LlmClient, usage: Usage) -> dict[str, Any]:
+    calculator = getattr(llm_client, "calculate_cost", None)
+    if not callable(calculator):
+        return {}
+    result: dict[str, Any] = {}
+    for currency in ("usd", "cny"):
+        try:
+            result[currency] = calculator(usage, currency=currency).to_dict()
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result

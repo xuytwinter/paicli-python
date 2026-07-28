@@ -188,12 +188,12 @@ class ExecutionPlan:
 
     def summarize(self) -> str:
         batches = self.execution_batches()
-        first_batch = ", ".join(task.id for task in batches[0]) if batches else "none"
-        final_batch = ", ".join(task.id for task in batches[-1]) if batches else "none"
+        first_batch = ", ".join(task.id for task in batches[0]) if batches else "无"
+        final_batch = ", ".join(task.id for task in batches[-1]) if batches else "无"
         return (
-            f"Plan {self.id}: {self.summary or self.goal}\n"
-            f"Tasks: {len(self.tasks)} | Parallel batches: {len(batches)} | "
-            f"Executable now: {len(self.executable_tasks())}\n"
-            f"First batch: {first_batch}\n"
-            f"Final convergence: {final_batch}"
+            f"计划 {self.id}：{self.summary or self.goal}\n"
+            f"任务数：{len(self.tasks)} | 并行批次：{len(batches)} | "
+            f"当前可执行：{len(self.executable_tasks())}\n"
+            f"首批任务：{first_batch}\n"
+            f"最终汇总：{final_batch}"
         )

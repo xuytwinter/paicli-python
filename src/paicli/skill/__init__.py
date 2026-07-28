@@ -1,3 +1,9 @@
-from paicli.skill.registry import Skill, SkillContextBuffer, SkillRegistry, SkillStateStore
+from paicli.skill.registry import (
+    Skill,
+    SkillContextBuffer,
+    SkillMatcher,
+    SkillRegistry,
+    SkillStateStore,
+)
 
-__all__ = ["Skill", "SkillContextBuffer", "SkillRegistry", "SkillStateStore"]
+__all__ = ["Skill", "SkillContextBuffer", "SkillMatcher", "SkillRegistry", "SkillStateStore"]

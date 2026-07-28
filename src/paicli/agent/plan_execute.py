@@ -14,16 +14,20 @@ from paicli.prompt import PromptAssembler
 from paicli.skill import SkillContextBuffer
 from paicli.snapshot import SnapshotService
 from paicli.tools.registry import ToolRegistry
-from paicli.types import Message
+from paicli.types import Message, Usage
 
 
 @dataclass(slots=True)
 class TaskRunResult:
     task: Task
     text: str
-    tokens: int
+    usage: Usage
     turns: int
     error: Exception | None = None
+
+    @property
+    def tokens(self) -> int:
+        return self.usage.total_tokens
 
 
 class PlanExecuteAgent:
@@ -46,24 +50,31 @@ class PlanExecuteAgent:
         self.planner = planner or Planner(llm_client)
         self.max_task_turns = max_task_turns
         self.history: list[Message] = []
-        self.skill_context_buffer = SkillContextBuffer()
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
         snapshot = SnapshotService(self.cwd)
         with suppress(Exception):
             snapshot.create("pre-turn")
-        total_tokens = 0
+        total_usage = Usage()
         total_turns = 0
         final_text = ""
         try:
-            yield {"type": "text_delta", "text": f"Planning task: {message}\n\n"}
-            plan = await self.planner.create_plan(message)
+            yield {"type": "text_delta", "text": f"正在规划任务：{message}\n\n"}
+            yield {"type": "plan_status", "phase": "planning"}
+            plan: ExecutionPlan | None = None
+            async for event in self.planner.stream_plan(message):
+                if event.get("type") == "plan_created":
+                    plan = event["plan"]
+                    continue
+                if event.get("type") == "usage":
+                    total_usage = total_usage + Usage.from_mapping(event.get("usage") or {})
+                yield event
+            if plan is None:
+                raise ValueError("planner did not produce an execution plan")
             yield {"type": "text_delta", "text": plan.summarize() + "\n\n"}
             async for event in self._execute_plan(plan):
                 if event.get("type") == "usage":
-                    usage = event.get("usage") or {}
-                    total_tokens += int(usage.get("input_tokens") or 0)
-                    total_tokens += int(usage.get("output_tokens") or 0)
+                    total_usage = total_usage + Usage.from_mapping(event.get("usage") or {})
                 elif event.get("type") == "plan_task_done":
                     total_turns += int(event.get("turns") or 0)
                     continue
@@ -80,42 +91,83 @@ class PlanExecuteAgent:
         finally:
             with suppress(Exception):
                 snapshot.create("post-turn")
-        yield {
+        done: dict[str, Any] = {
             "type": "done",
             "total_turns": total_turns,
-            "total_tokens": total_tokens,
+            "total_tokens": total_usage.total_tokens,
+            "usage": total_usage.to_dict(),
             "messages": self.history,
         }
+        costs = _calculate_costs(self.llm_client, total_usage)
+        if costs:
+            done["cost"] = costs
+        yield done
 
     async def _execute_plan(self, plan: ExecutionPlan) -> AsyncIterator[dict[str, Any]]:
-        yield {"type": "text_delta", "text": "Executing plan...\n\n"}
+        yield {"type": "text_delta", "text": "开始执行计划……\n\n"}
+        yield {"type": "plan_status", "phase": "execution"}
         plan.mark_started()
         while True:
             executable = _executable_tasks_in_order(plan)
             if not executable:
                 break
             if len(executable) == 1:
-                result = await self._execute_task(plan, executable[0])
+                result: TaskRunResult | None = None
+                async for event in self._execute_task_stream(plan, executable[0]):
+                    if event.get("type") == "plan_task_result":
+                        result = event["result"]
+                    else:
+                        yield event
+                if result is None:
+                    raise RuntimeError(f"task {executable[0].id} did not produce a result")
                 async for event in self._apply_task_result(result):
                     yield event
                 continue
             yield {
                 "type": "text_delta",
-                "text": (
-                    f"Running parallel batch: {', '.join(task.id for task in executable)}\n\n"
-                ),
+                "text": (f"正在并行执行：{', '.join(task.id for task in executable)}\n\n"),
             }
-            results = await asyncio.gather(
-                *(self._execute_task(plan, task) for task in executable),
-                return_exceptions=False,
-            )
-            for result in results:
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            runners = [
+                asyncio.create_task(self._pump_task_events(plan, task, queue))
+                for task in executable
+            ]
+            results: dict[str, TaskRunResult] = {}
+            finished = 0
+            try:
+                while finished < len(runners):
+                    event = await queue.get()
+                    event_type = event.get("type")
+                    if event_type == "plan_task_stream_done":
+                        finished += 1
+                    elif event_type == "plan_task_result":
+                        result = event["result"]
+                        results[result.task.id] = result
+                    else:
+                        yield event
+            finally:
+                if finished < len(runners):
+                    for runner in runners:
+                        if not runner.done():
+                            runner.cancel()
+                await asyncio.gather(*runners, return_exceptions=True)
+
+            for task in executable:
+                result = results.get(task.id)
+                if result is None:
+                    result = TaskRunResult(
+                        task=task,
+                        text="",
+                        usage=Usage(),
+                        turns=0,
+                        error=RuntimeError(f"task {task.id} did not produce a result"),
+                    )
                 async for event in self._apply_task_result(result):
                     yield event
 
         if plan.has_failed():
             plan.mark_failed()
-            yield {"type": "text_delta", "text": "Plan partially completed with failed tasks.\n\n"}
+            yield {"type": "text_delta", "text": "计划部分完成，但有任务执行失败。\n\n"}
         elif plan.is_all_completed():
             plan.mark_completed()
             yield {"type": "text_delta", "text": _build_plan_result(plan)}
@@ -123,42 +175,64 @@ class PlanExecuteAgent:
             plan.mark_failed()
             yield {
                 "type": "text_delta",
-                "text": "Plan stalled because dependencies were not satisfied.\n\n",
+                "text": "计划已停滞，因为任务依赖未满足。\n\n",
             }
 
     async def _apply_task_result(self, result: TaskRunResult) -> AsyncIterator[dict[str, Any]]:
         if result.error:
             result.task.mark_failed(str(result.error))
-            yield {"type": "text_delta", "text": f"Failed [{result.task.id}]: {result.error}\n\n"}
+            yield {"type": "text_delta", "text": f"失败 [{result.task.id}]：{result.error}\n\n"}
             return
         result.task.mark_completed(result.text)
         yield {
             "type": "text_delta",
-            "text": f"Completed [{result.task.id}]: {_preview(result.text)}\n\n",
+            "text": f"已完成 [{result.task.id}]：{_preview(result.text)}\n\n",
         }
         yield {
             "type": "usage",
-            "usage": {"input_tokens": result.tokens, "output_tokens": 0},
+            "usage": result.usage.to_dict(),
         }
         yield {"type": "plan_task_done", "turns": result.turns, "tokens": result.tokens}
 
-    async def _execute_task(self, plan: ExecutionPlan, task: Task) -> TaskRunResult:
+    async def _pump_task_events(
+        self,
+        plan: ExecutionPlan,
+        task: Task,
+        queue: asyncio.Queue[dict[str, Any]],
+    ) -> None:
+        try:
+            async for event in self._execute_task_stream(plan, task):
+                await queue.put(event)
+        finally:
+            await queue.put({"type": "plan_task_stream_done", "task_id": task.id})
+
+    async def _execute_task_stream(
+        self,
+        plan: ExecutionPlan,
+        task: Task,
+    ) -> AsyncIterator[dict[str, Any]]:
         task.mark_started()
+        yield {
+            "type": "plan_task_started",
+            "task_id": task.id,
+            "task_description": task.description,
+        }
         text = ""
         tool_results: list[str] = []
-        tokens = 0
+        usage = Usage()
         turns = 0
         try:
             async for event in query(
                 llm_client=self.llm_client,
                 tool_registry=self.tool_registry,
-                system_prompt=self._task_system_prompt(task),
+                system_prompt=self._task_system_prompt(plan, task),
                 user_message=_task_context(plan, task),
                 history=[],
                 cwd=self.cwd,
                 config=self.config,
                 approval_callback=self.approval_callback,
-                skill_context_buffer=self.skill_context_buffer,
+                # Parallel plan tasks must never share one-shot Skill context.
+                skill_context_buffer=SkillContextBuffer(),
                 max_turns=self.max_task_turns,
             ):
                 if event.get("type") == "text_delta":
@@ -167,33 +241,59 @@ class PlanExecuteAgent:
                     content = str(event.get("result") or "")
                     if content:
                         tool_results.append(content)
-                elif event.get("type") == "usage":
-                    usage = event.get("usage") or {}
-                    tokens += int(usage.get("input_tokens") or 0)
-                    tokens += int(usage.get("output_tokens") or 0)
+                    yield _with_task_context(event, task)
+                elif event.get("type") in {
+                    "thinking_delta",
+                    "tool_call",
+                    "context_compressed",
+                }:
+                    yield _with_task_context(event, task)
                 elif event.get("type") == "done":
                     turns += int(event.get("total_turns") or 0)
+                    usage = usage + Usage.from_mapping(event.get("usage") or {})
                 elif event.get("type") == "error":
                     raise event["error"]
             result_text = text.strip() or "\n".join(tool_results).strip()
-            return TaskRunResult(task=task, text=result_text, tokens=tokens, turns=turns)
+            yield {
+                "type": "plan_task_result",
+                "result": TaskRunResult(task=task, text=result_text, usage=usage, turns=turns),
+            }
         except Exception as exc:  # noqa: BLE001
-            return TaskRunResult(task=task, text="", tokens=tokens, turns=turns, error=exc)
+            yield {
+                "type": "plan_task_result",
+                "result": TaskRunResult(
+                    task=task,
+                    text="",
+                    usage=usage,
+                    turns=turns,
+                    error=exc,
+                ),
+            }
 
-    def _task_system_prompt(self, task: Task) -> str:
+    def _task_system_prompt(self, plan: ExecutionPlan, task: Task) -> str:
         base = PromptAssembler(
             config=self.config,
             cwd=self.cwd,
             tool_names=self.tool_registry.list_names(),
             model=self.llm_client.model_name,
             provider=self.llm_client.provider_name,
-        ).build()
+        ).build_static()
         return (
             base
-            + "\n\nYou are executing one task inside a Plan-and-Execute DAG.\n"
-            + f"Task id: {task.id}\nTask type: {task.type.value}\n"
-            + "Complete this task concretely. Use tools when needed."
+            + "\n\n你正在执行 Plan-and-Execute DAG 中的一个任务。\n"
+            + f"任务 id：{task.id}\n任务类型：{task.type.value}\n"
+            + "请具体完成任务，并在需要时使用工具。"
+            + _task_language_instruction(plan.goal)
         )
+
+
+def _with_task_context(event: dict[str, Any], task: Task) -> dict[str, Any]:
+    return {
+        **event,
+        "phase": "execution",
+        "task_id": task.id,
+        "task_description": task.description,
+    }
 
 
 def _executable_tasks_in_order(plan: ExecutionPlan) -> list[Task]:
@@ -203,10 +303,10 @@ def _executable_tasks_in_order(plan: ExecutionPlan) -> list[Task]:
 
 def _task_context(plan: ExecutionPlan, task: Task) -> str:
     lines = [
-        f"Goal: {plan.goal}",
-        f"Current task [{task.id}]: {task.description}",
+        f"目标：{plan.goal}",
+        f"当前任务 [{task.id}]：{task.description}",
         "",
-        "Completed dependency results:",
+        "已完成的依赖任务结果：",
     ]
     for dep_id in task.dependencies:
         dep = plan.get_task(dep_id)
@@ -216,12 +316,25 @@ def _task_context(plan: ExecutionPlan, task: Task) -> str:
 
 
 def _build_plan_result(plan: ExecutionPlan) -> str:
-    lines = ["Plan execution completed.", "", "Task summary:"]
+    status_labels = {
+        TaskStatus.PENDING: "待执行",
+        TaskStatus.RUNNING: "执行中",
+        TaskStatus.COMPLETED: "已完成",
+        TaskStatus.FAILED: "失败",
+        TaskStatus.SKIPPED: "已跳过",
+    }
+    lines = ["计划执行完成。", "", "任务摘要："]
     for task in plan.all_tasks():
-        lines.append(f"- [{task.id}] {task.status.value}: {task.description}")
+        lines.append(f"- [{task.id}] {status_labels[task.status]}：{task.description}")
         if task.result:
-            lines.append(f"  Result: {_preview(task.result)}")
+            lines.append(f"  结果：{_preview(task.result)}")
     return "\n".join(lines) + "\n"
+
+
+def _task_language_instruction(goal: str) -> str:
+    if any("\u4e00" <= char <= "\u9fff" for char in goal):
+        return "\n用户目标包含中文；所有进度说明、分析和最终结果都必须使用中文。"
+    return "\nUse the same language as the user's goal for all progress and results."
 
 
 def _preview(text: str, max_len: int = 160) -> str:
@@ -229,3 +342,16 @@ def _preview(text: str, max_len: int = 160) -> str:
     if len(value) <= max_len:
         return value
     return value[: max_len - 3] + "..."
+
+
+def _calculate_costs(llm_client: LlmClient, usage: Usage) -> dict[str, Any]:
+    calculator = getattr(llm_client, "calculate_cost", None)
+    if not callable(calculator):
+        return {}
+    result: dict[str, Any] = {}
+    for currency in ("usd", "cny"):
+        try:
+            result[currency] = calculator(usage, currency=currency).to_dict()
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result
