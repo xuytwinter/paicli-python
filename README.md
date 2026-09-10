@@ -1,3 +1,5 @@
+> 个人学习与维护项目。
+
 # PaiCLI Python
 
 PaiCLI Python 是一个运行在终端里的 AI Agent CLI，面向真实项目开发场景：读写文件、搜索代码、执行命令、联网检索、调用 MCP 工具、保存记忆、生成快照、恢复现场，并通过 Runtime API 对外提供线程、turn、事件和后台任务能力。
